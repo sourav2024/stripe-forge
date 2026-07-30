@@ -1,0 +1,349 @@
+// Prisma schema for StripeForge — an educational, Stripe-inspired payment platform.
+//
+// Design notes (the "why"):
+// - Monetary amounts are stored as integer minor units (e.g. cents) using BigInt.
+//   Floating point is never used for money to avoid rounding drift across a ledger.
+// - The ledger is append-only and double-entry: every financial movement is
+//   recorded as balanced DEBIT/CREDIT entries so the books always reconcile.
+// - Idempotency keys are first-class so client retries can never double-charge.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum MerchantRole {
+  OWNER
+  ADMIN
+  VIEWER
+}
+
+// Mirrors Stripe's PaymentIntent lifecycle (simplified).
+enum PaymentIntentStatus {
+  requires_payment_method
+  requires_confirmation
+  processing
+  succeeded
+  failed
+  canceled
+}
+
+enum PaymentStatus {
+  pending
+  processing
+  succeeded
+  failed
+}
+
+enum RefundStatus {
+  pending
+  succeeded
+  failed
+}
+
+// Debit/Credit for double-entry bookkeeping.
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+// Logical accounts each ledger entry can post against.
+enum LedgerAccount {
+  MERCHANT_BALANCE
+  PLATFORM_FEES
+  CASH
+  REFUNDS_PAYABLE
+}
+
+enum WebhookDeliveryStatus {
+  pending
+  succeeded
+  failed
+  dead
+}
+
+enum JobStatus {
+  queued
+  active
+  completed
+  failed
+  dead
+}
+
+// ---------------------------------------------------------------------------
+// Auth & tenancy
+// ---------------------------------------------------------------------------
+
+/// A Merchant is the top-level tenant. All other records are scoped to a merchant.
+model Merchant {
+  id                     String       @id @default(uuid())
+  email                  String       @unique
+  passwordHash           String
+  name                   String
+  role                   MerchantRole @default(OWNER)
+  emailVerified          Boolean      @default(false)
+  emailVerifyToken       String?      @unique
+  passwordResetToken     String?      @unique
+  passwordResetExpiresAt DateTime?
+  // Public/secret API keys let merchants authenticate server-to-server calls.
+  apiKeyPublic           String       @unique
+  apiKeySecret           String       @unique
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  customers        Customer[]
+  paymentIntents   PaymentIntent[]
+  payments         Payment[]
+  refunds          Refund[]
+  ledgerEntries    LedgerEntry[]
+  webhookEndpoints WebhookEndpoint[]
+  refreshTokens    RefreshToken[]
+  auditLogs        AuditLog[]
+
+  @@map("merchants")
+}
+
+/// Rotating refresh tokens enable short-lived access tokens without re-login.
+model RefreshToken {
+  id         String    @id @default(uuid())
+  merchantId String
+  merchant   Merchant  @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  // Only the hash is stored so a DB leak does not expose usable tokens.
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([merchantId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id         String   @id @default(uuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  email      String
+  name       String?
+  phone      String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  paymentIntents PaymentIntent[]
+  payments       Payment[]
+
+  // A customer email is unique per merchant, not globally.
+  @@unique([merchantId, email])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+model PaymentIntent {
+  id             String              @id @default(uuid())
+  merchantId     String
+  merchant       Merchant            @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customerId     String?
+  customer       Customer?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  amount         BigInt // minor units
+  currency       String              @default("usd")
+  status         PaymentIntentStatus @default(requires_payment_method)
+  description    String?
+  metadata       Json?
+  // The idempotency key ties client retries to a single logical operation.
+  // Scoped per-merchant so one tenant's keys can never collide with another's.
+  idempotencyKey String?
+  clientSecret   String              @unique
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  payments Payment[]
+
+  @@unique([merchantId, idempotencyKey])
+  // Hot path: list a merchant's intents newest-first, optionally by status.
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@index([merchantId, status, createdAt(sort: Desc)])
+  @@index([customerId])
+  @@map("payment_intents")
+}
+
+model Payment {
+  id              String        @id @default(uuid())
+  merchantId      String
+  merchant        Merchant      @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  paymentIntentId String
+  paymentIntent   PaymentIntent @relation(fields: [paymentIntentId], references: [id], onDelete: Cascade)
+  customerId      String?
+  customer        Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  amount          BigInt
+  currency        String        @default("usd")
+  status          PaymentStatus @default(pending)
+  // Amount already refunded, tracked to enforce partial-refund limits.
+  amountRefunded  BigInt        @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  refunds       Refund[]
+  ledgerEntries LedgerEntry[]
+
+  // A payment intent yields at most one successful Payment. This unique
+  // constraint is the DB-level backstop against a double-confirm race creating
+  // two charges for one intent.
+  @@unique([paymentIntentId])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@map("payments")
+}
+
+model Refund {
+  id         String       @id @default(uuid())
+  merchantId String
+  merchant   Merchant     @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  paymentId  String
+  payment    Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  amount     BigInt
+  currency   String       @default("usd")
+  status     RefundStatus @default(pending)
+  reason     String?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  ledgerEntries LedgerEntry[]
+
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+// ---------------------------------------------------------------------------
+// Ledger (append-only, double-entry)
+// ---------------------------------------------------------------------------
+
+/// Each LedgerEntry is one leg of a balanced transaction. Entries sharing a
+/// transactionId must sum to zero (debits == credits). Rows are never updated
+/// or deleted — corrections are new compensating entries.
+model LedgerEntry {
+  id            String          @id @default(uuid())
+  merchantId    String
+  merchant      Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  // Groups the legs of a single double-entry transaction.
+  transactionId String
+  account       LedgerAccount
+  direction     LedgerDirection
+  amount        BigInt
+  currency      String          @default("usd")
+  paymentId     String?
+  payment       Payment?        @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  refundId      String?
+  refund        Refund?         @relation(fields: [refundId], references: [id], onDelete: SetNull)
+  description   String?
+  createdAt     DateTime        @default(now())
+
+  // Ledger is the fastest-growing table (2+ rows per money movement). The
+  // composite index serves the merchant history query (newest-first) directly.
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@index([transactionId])
+  @@index([merchantId, account])
+  @@map("ledger_entries")
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+model WebhookEndpoint {
+  id            String   @id @default(uuid())
+  merchantId    String
+  merchant      Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  url           String
+  // Signing secret used to compute the HMAC signature header on each delivery.
+  signingSecret String
+  // Subscribed event types, e.g. ["payment.succeeded", "refund.created"].
+  enabledEvents String[]
+  enabled       Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  deliveries WebhookDelivery[]
+
+  @@index([merchantId])
+  @@map("webhook_endpoints")
+}
+
+model WebhookDelivery {
+  id                String                @id @default(uuid())
+  webhookEndpointId String
+  webhookEndpoint   WebhookEndpoint       @relation(fields: [webhookEndpointId], references: [id], onDelete: Cascade)
+  eventType         String
+  payload           Json
+  status            WebhookDeliveryStatus @default(pending)
+  attempts          Int                   @default(0)
+  responseStatus    Int?
+  responseBody      String?
+  nextRetryAt       DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  @@index([webhookEndpointId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("webhook_deliveries")
+}
+
+// ---------------------------------------------------------------------------
+// Observability
+// ---------------------------------------------------------------------------
+
+/// Mirror of BullMQ job state persisted for dashboard visibility. Scoped to a
+/// merchant so the jobs endpoint never leaks one tenant's job data to another.
+model JobLog {
+  id         String    @id @default(uuid())
+  // Nullable: some jobs (e.g. platform emails) are not tied to a merchant.
+  merchantId String?
+  queue      String
+  jobId      String
+  name       String
+  status     JobStatus @default(queued)
+  attempts   Int       @default(0)
+  data       Json?
+  error      String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  // Enables a real upsert so concurrent status events for one job cannot race
+  // into duplicate rows.
+  @@unique([queue, jobId])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("job_logs")
+}
+
+/// Immutable audit trail of security- and money-relevant actions.
+model AuditLog {
+  id         String    @id @default(uuid())
+  merchantId String?
+  merchant   Merchant? @relation(fields: [merchantId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String?
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime  @default(now())
+
+  @@index([merchantId])
+  @@index([action])
+  @@map("audit_logs")
+}

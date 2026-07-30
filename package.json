@@ -1,0 +1,17 @@
+{
+  "name": "stripeforge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "StripeForge — an educational, Stripe-inspired payment platform (monorepo root)",
+  "scripts": {
+    "prepare": "husky",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:worker": "npm --prefix backend run worker",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "typecheck": "npm --prefix backend run typecheck && npm --prefix frontend run build -- --mode development",
+    "test": "npm --prefix backend test"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7"
+  }
+}

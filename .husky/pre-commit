@@ -1,0 +1,3 @@
+# Block commits that don't typecheck or fail unit tests. Kept fast: no build,
+# no integration tests — those run in CI.
+npm --prefix backend run typecheck && npm --prefix backend test

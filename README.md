@@ -401,3 +401,7 @@ Building/reading StripeForge teaches you to:
 ## License
 
 [MIT](./LICENSE) © 2026 Sourav Kashyap.
+
+## Design notes
+
+Architecture diagram, request flow, design trade-offs and known limitations: [docs/DESIGN-NOTES.md](docs/DESIGN-NOTES.md).
